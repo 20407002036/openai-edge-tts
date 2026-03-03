@@ -152,6 +152,11 @@ def list_models():
 def list_voices_formatted():
     return jsonify({"voices": get_voices_formatted()})
 
+@app.route('/health', methods=['GET'])
+@app.route('/healthz', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/v1/voices', methods=['GET', 'POST'])
 @app.route('/voices', methods=['GET', 'POST'])
 @require_api_key
