@@ -1,6 +1,7 @@
 # server.py
 
 from flask import Flask, request, send_file, jsonify, Response
+from flask_swagger_ui import get_swaggerui_blueprint
 from gevent.pywsgi import WSGIServer
 from dotenv import load_dotenv
 import os
@@ -16,12 +17,19 @@ from utils import getenv_bool, require_api_key, AUDIO_FORMAT_MIME_TYPES, DETAILE
 app = Flask(__name__)
 load_dotenv()
 
+# Swagger UI
+SWAGGER_URL = '/docs'
+API_URL = '/swagger.json'
+swaggerui_blueprint = get_swaggerui_blueprint(SWAGGER_URL, API_URL)
+app.register_blueprint(swaggerui_blueprint)
+
 API_KEY = os.getenv('API_KEY', DEFAULT_CONFIGS["API_KEY"])
 PORT = int(os.getenv('PORT', str(DEFAULT_CONFIGS["PORT"])))
 
 DEFAULT_VOICE = os.getenv('DEFAULT_VOICE', DEFAULT_CONFIGS["DEFAULT_VOICE"])
 DEFAULT_RESPONSE_FORMAT = os.getenv('DEFAULT_RESPONSE_FORMAT', DEFAULT_CONFIGS["DEFAULT_RESPONSE_FORMAT"])
 DEFAULT_SPEED = float(os.getenv('DEFAULT_SPEED', str(DEFAULT_CONFIGS["DEFAULT_SPEED"])))
+DEFAULT_LANGUAGE = os.getenv('DEFAULT_LANGUAGE', DEFAULT_CONFIGS["DEFAULT_LANGUAGE"])
 
 REMOVE_FILTER = getenv_bool('REMOVE_FILTER', DEFAULT_CONFIGS["REMOVE_FILTER"])
 EXPAND_API = getenv_bool('EXPAND_API', DEFAULT_CONFIGS["EXPAND_API"])
@@ -82,7 +90,18 @@ def text_to_speech():
             text = prepare_tts_input_with_context(text)
 
         # model = data.get('model', DEFAULT_MODEL)
-        voice = data.get('voice', DEFAULT_VOICE)
+        language = data.get('language', DEFAULT_LANGUAGE)
+        voice_from_request = data.get('voice')
+        if voice_from_request:
+            # Explicit voice always wins
+            voice = voice_from_request
+        else:
+            # Auto-select first available voice for the requested language
+            available_voices = get_voices(language)
+            if available_voices:
+                voice = available_voices[0].get('name', DEFAULT_VOICE)
+            else:
+                voice = DEFAULT_VOICE
         response_format = data.get('response_format', DEFAULT_RESPONSE_FORMAT)
         speed = float(data.get('speed', DEFAULT_SPEED))
         
@@ -126,7 +145,8 @@ def text_to_speech():
                 mimetype=mime_type,
                 headers={
                     'Content-Type': mime_type,
-                    'Content-Length': str(len(audio_data))
+                    'Content-Length': str(len(audio_data)),
+                    'Content-Disposition': f'attachment; filename="speech.{response_format}"'
                 }
             )
             
@@ -156,6 +176,194 @@ def list_voices_formatted():
 @app.route('/healthz', methods=['GET'])
 def health_check():
     return jsonify({"status": "ok"}), 200
+
+@app.route('/swagger.json', methods=['GET'])
+def swagger_spec():
+    spec = {
+        "openapi": "3.0.0",
+        "info": {
+            "title": "OpenAI Edge TTS API",
+            "description": "OpenAI-compatible Text-to-Speech API powered by Microsoft Edge TTS.",
+            "version": "1.0.0"
+        },
+        "servers": [{"url": f"http://localhost:{PORT}"}],
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer"
+                }
+            },
+            "schemas": {
+                "SpeechRequest": {
+                    "type": "object",
+                    "required": ["input"],
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Text to synthesize.",
+                            "example": "Hello, world!"
+                        },
+                        "voice": {
+                            "type": "string",
+                            "description": "Edge-TTS voice name or OpenAI voice alias (e.g. alloy, shimmer, en-US-AvaNeural). When omitted, a voice is auto-selected based on `language`.",
+                            "example": "en-US-AvaNeural"
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "BCP-47 locale used to auto-select a voice when `voice` is not provided. Ignored when `voice` is explicitly set.",
+                            "example": "en-US"
+                        },
+                        "response_format": {
+                            "type": "string",
+                            "enum": ["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                            "default": "mp3",
+                            "description": "Audio output format."
+                        },
+                        "speed": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 2,
+                            "default": 1.0,
+                            "description": "Playback speed multiplier (1.0 = normal)."
+                        },
+                        "stream_format": {
+                            "type": "string",
+                            "enum": ["audio", "sse"],
+                            "default": "audio",
+                            "description": "Response delivery mode. `audio` returns raw binary; `sse` streams Server-Sent Events."
+                        }
+                    }
+                },
+                "ElevenLabsRequest": {
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": {
+                        "text": {"type": "string", "example": "Hello from ElevenLabs endpoint"}
+                    }
+                }
+            }
+        },
+        "security": [{"BearerAuth": []}],
+        "paths": {
+            "/v1/audio/speech": {
+                "post": {
+                    "tags": ["Speech"],
+                    "summary": "Generate speech audio",
+                    "description": "Converts input text to audio. Pass `language` to auto-select a voice for that locale, or pass `voice` explicitly to override.",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SpeechRequest"}}}
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Audio file or SSE stream",
+                            "content": {
+                                "audio/mpeg": {"schema": {"type": "string", "format": "binary"}},
+                                "text/event-stream": {"schema": {"type": "string"}}
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "401": {"description": "Unauthorized"},
+                        "500": {"description": "Internal server error"}
+                    }
+                }
+            },
+            "/v1/models": {
+                "get": {
+                    "tags": ["Models"],
+                    "summary": "List available TTS models",
+                    "security": [],
+                    "responses": {"200": {"description": "List of models", "content": {"application/json": {"schema": {"type": "object"}}}}}
+                }
+            },
+            "/v1/audio/voices": {
+                "get": {
+                    "tags": ["Voices"],
+                    "summary": "List OpenAI-compatible voices",
+                    "security": [],
+                    "responses": {"200": {"description": "List of OpenAI-mapped voices", "content": {"application/json": {"schema": {"type": "object"}}}}}
+                }
+            },
+            "/v1/voices": {
+                "get": {
+                    "tags": ["Voices"],
+                    "summary": "List edge-tts voices filtered by language",
+                    "parameters": [
+                        {
+                            "name": "language",
+                            "in": "query",
+                            "description": "BCP-47 locale to filter voices (e.g. fr-FR). Omit for default language.",
+                            "schema": {"type": "string"}
+                        }
+                    ],
+                    "responses": {"200": {"description": "Filtered voice list", "content": {"application/json": {"schema": {"type": "object"}}}}}
+                }
+            },
+            "/v1/voices/all": {
+                "get": {
+                    "tags": ["Voices"],
+                    "summary": "List all available edge-tts voices",
+                    "responses": {"200": {"description": "All voices", "content": {"application/json": {"schema": {"type": "object"}}}}}
+                }
+            },
+            "/health": {
+                "get": {
+                    "tags": ["Health"],
+                    "summary": "Health check",
+                    "security": [],
+                    "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"type": "object", "properties": {"status": {"type": "string", "example": "ok"}}}}}}}
+                }
+            },
+            "/elevenlabs/v1/text-to-speech/{voice_id}": {
+                "post": {
+                    "tags": ["ElevenLabs (beta)"],
+                    "summary": "ElevenLabs-compatible TTS endpoint",
+                    "description": "Requires `EXPAND_API=true`.",
+                    "parameters": [
+                        {
+                            "name": "voice_id",
+                            "in": "path",
+                            "required": True,
+                            "description": "Edge-TTS voice name (e.g. en-US-AvaNeural)",
+                            "schema": {"type": "string"}
+                        }
+                    ],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ElevenLabsRequest"}}}
+                    },
+                    "responses": {
+                        "200": {"description": "MP3 audio file", "content": {"audio/mpeg": {"schema": {"type": "string", "format": "binary"}}}},
+                        "400": {"description": "Bad request"},
+                        "500": {"description": "Endpoint disabled or TTS error"}
+                    }
+                }
+            },
+            "/azure/cognitiveservices/v1": {
+                "post": {
+                    "tags": ["Azure (beta)"],
+                    "summary": "Azure Cognitive Services-compatible SSML endpoint",
+                    "description": "Accepts an SSML payload. Requires `EXPAND_API=true`.",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/ssml+xml": {
+                                "schema": {"type": "string"},
+                                "example": "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='en-US-AvaNeural'>Hello</voice></speak>"
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "MP3 audio file", "content": {"audio/mpeg": {"schema": {"type": "string", "format": "binary"}}}},
+                        "400": {"description": "Invalid SSML"},
+                        "500": {"description": "Endpoint disabled or TTS error"}
+                    }
+                }
+            }
+        }
+    }
+    return jsonify(spec)
 
 @app.route('/v1/voices', methods=['GET', 'POST'])
 @app.route('/voices', methods=['GET', 'POST'])
